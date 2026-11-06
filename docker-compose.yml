@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    volumes:
+      # Исходники через bind mount — код правится на хосте, запускается в контейнере
+      - .:/app
+    env_file:
+      # .env опционален: токен бота передаётся только через env, в git/образ не попадает
+      - path: .env
+        required: false

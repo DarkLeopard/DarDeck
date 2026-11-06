@@ -1,0 +1,20 @@
+# Чувствительное и приватное — никогда не попадает в образ
+.env
+.env.*
+packs/
+media/
+.superpowers/
+
+# Git и прочее
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+
+# Мусор сборки
+__pycache__/
+*.pyc
+*.db
+.venv/
+node_modules/
