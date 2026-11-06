@@ -1,0 +1,19 @@
+[project]
+name = "dardeck"
+version = "0.1.0"
+description = "Delight — card engine for couples (pure library, no framework binding)"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools]
+packages = ["engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
