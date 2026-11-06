@@ -25,6 +25,17 @@ from engine.ratings import (
 from tools.cleanup import find_for_review, load_cards, main, run
 
 
+def make_seed_card(cid: str, text: str) -> Card:
+    return Card(
+        id=cid,
+        theme="т",
+        text=text,
+        source=SourceKind.SEED,
+        visibility=CardVisibility.PUBLIC,
+        status=CardStatus.POOL,
+    )
+
+
 def make_user(uid: str) -> User:
     return User(id=uid, username=uid)
 
@@ -143,6 +154,72 @@ def test_is_for_review_threshold():
     assert not is_for_review(average=0.0, count=5)
     assert not is_for_review(average=0.5, count=10)
     assert not is_for_review(average=1.0, count=0)
+
+
+def test_find_for_review_pool_only(tmp_path):
+    """Cleanup-кандидаты — только pool: draft/retired в ревью-лист не попадают."""
+    draft = make_pool_card("d1", "Черновик")
+    draft.status = CardStatus.DRAFT
+    retired = make_pool_card("r1", "Снятая")
+    retired.status = CardStatus.RETIRED
+    db = tmp_path / "deck.sqlite"
+    src = SqliteCardSource(db)
+    src.add_card(draft)
+    src.add_card(retired)
+    src.close()
+
+    ratings = RatingEngine()
+    for card in (draft, retired):
+        for i in range(5):
+            ratings.rate(make_user(f"u{i}"), card, -1)
+
+    review, retired_ids = run(db, ratings=ratings, confirm=True)
+    assert review == []  # draft/retired никогда не в ревью-листе
+    assert retired_ids == []  # и не перезаписываются ретиром
+    assert get_db_status(db, "d1") == CardStatus.DRAFT
+    assert get_db_status(db, "r1") == CardStatus.RETIRED
+
+
+def test_low_rated_seed_card_not_retired(tmp_path, capsys):
+    """SEED-карточка не ретирится cleanup'ом даже при среднем <0 при >=5."""
+    seed = make_seed_card("s1", "Плохая seed-карточка")
+    db = tmp_path / "deck.sqlite"
+    src = SqliteCardSource(db)
+    src.add_card(seed)
+    src.close()
+    ratings = RatingEngine()
+    for i in range(5):
+        ratings.rate(make_user(f"u{i}"), seed, -1)
+
+    review, retired = run(db, ratings=ratings, confirm=True)
+
+    assert [c.id for c in review] == ["s1"]  # pool, низкие оценки — в списке
+    assert retired == []  # но ретир пропущен
+    assert get_db_status(db, "s1") == CardStatus.POOL
+    out = capsys.readouterr().out
+    assert "s1" in out and "seed-карточка" in out  # лог-строка о пропуске
+
+
+def test_retire_skips_seed_among_picked(tmp_path):
+    """Среди выбранных ретирятся только UGC-карточки; seed остаётся в pool."""
+    seed = make_seed_card("s2", "Плохая seed")
+    ugc = make_pool_card("u2", "Плохая ugc")
+    db = tmp_path / "deck.sqlite"
+    src = SqliteCardSource(db)
+    src.add_card(seed)
+    src.add_card(ugc)
+    src.close()
+    ratings = RatingEngine()
+    for card in (seed, ugc):
+        for i in range(5):
+            ratings.rate(make_user(f"u{i}"), card, -1)
+
+    review, retired = run(db, ratings=ratings, confirm=True)
+
+    assert [c.id for c in review] == ["s2", "u2"]
+    assert [c.id for c in retired] == ["u2"]
+    assert get_db_status(db, "s2") == CardStatus.POOL
+    assert get_db_status(db, "u2") == CardStatus.RETIRED
 
 
 def test_find_for_review_over_cards():

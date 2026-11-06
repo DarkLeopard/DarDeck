@@ -21,12 +21,8 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from adapters.db.sqlite import (
-    SqliteCardSource,
-    _row_to_card,
-    _SEL_CARDS,  # noqa: F401
-)
-from engine.models import Card, CardStatus
+from adapters.db.sqlite import SqliteCardSource, _row_to_card, _SEL_CARDS
+from engine.models import Card, CardStatus, SourceKind
 from engine.ratings import (
     CardRating,
     RatingEngine,
@@ -44,9 +40,15 @@ def load_cards(source: SqliteCardSource) -> list[Card]:
 
 
 def find_for_review(cards: Sequence[Card], ratings: RatingEngine) -> list[Card]:
-    """Ревью-лист: карточки со средним <0 при >=5 оценках."""
+    """Ревью-лист: только pool-карточки со средним <0 при >=5 оценках.
+
+    draft/retired кандидатами не бывают: draft ещё не в выдаче, retired уже
+    снят — таких карточек в ревью-листе нет и перезаписывать их нечем.
+    """
     picked: list[Card] = []
     for card in cards:
+        if card.status is not CardStatus.POOL:
+            continue
         card_rating: CardRating = ratings.summary(card.id)
         if is_for_review(card_rating.average, card_rating.count):
             picked.append(card)
@@ -57,13 +59,20 @@ def retire(source: SqliteCardSource, cards: Sequence[Card], confirm: bool) -> li
     """Retire карточек: статус -> retired (движок их больше не выдаёт).
 
     Без confirm ничего не пишет — ревью-лист только печатается.
+    Seed-карточки не ретирятся никогда (лог-строка о пропуске): их удаляет
+    человек, пересобрав сид-колоду, не cleanup.
     """
     if not confirm:
         return []
+    retired: list[Card] = []
     for card in cards:
+        if card.source is SourceKind.SEED:
+            print(f"Пропущено: {card.id} — seed-карточка, cleanup её не ретирит.")
+            continue
         card.status = CardStatus.RETIRED
         source.add_card(card)
-    return list(cards)
+        retired.append(card)
+    return retired
 
 
 def run(
