@@ -448,6 +448,13 @@ def main() -> None:
     Без токена BotService собирается с LogSender и режим dry-run показывается
     в логе; polling без токена невозможен, долгий процесс не поднимаем.
     """
+    # Видимость логов в docker (stderr не tty): INFO иначе теряется (lastResort).
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+
     from aiogram import Dispatcher
 
     from adapters.db.sqlite import SqliteCardSource
