@@ -111,11 +111,12 @@ class BotService:
     def today(self, user_id: str, now: datetime | None = None) -> str:
         """/today — выдать карточку дня: движок решает, Sender доставляет обоим."""
         pair = self._pair_of(user_id)
-        self._ensure_daily_gate(pair, now or datetime.now())
+        stamped = now or datetime.now()
+        self._ensure_daily_gate(pair, stamped)
 
         card = self._engine.issue_card(pair)
         self._last_card[pair.id] = card
-        self._last_issue_at[pair.id] = now or datetime.now()
+        self._last_issue_at[pair.id] = stamped
         for u in pair.users:
             self._sender.send(u, card)
         return "Карточка дня отправлена вам обоим. Выполнили — ставьте /done."
@@ -124,8 +125,11 @@ class BotService:
         """/done — отметить выполненной последнюю выданную карточку пары."""
         pair = self._pair_of(user_id)
         card = self._last_card.get(pair.id)
-        if card is None or card.id not in self._engine.pair_state(pair).issued:
+        state = self._engine.pair_state(pair)
+        if card is None or card.id not in state.issued:
             raise NotIssued("Сначала возьмите карточку дня командой /today.")
+        if card.id in state.completed:
+            raise NotIssued("Эта карточка уже отмечена выполненной — повторный /done не нужен.")
         self._engine.mark_completed(pair, card)
         return 'Отметили готово — молодец! Оцените карточку: /rate 1..5.'
 
@@ -215,6 +219,7 @@ class TelegramSender(Sender):
 
     def __init__(self, bot: Any) -> None:
         self._bot = bot
+        self._tasks: set[asyncio.Task] = set()  # strong ref: fire-and-forget task не соберёт GC
 
     def send(self, user: User, card: Card) -> None:
         text = format_card(card)
@@ -223,12 +228,18 @@ class TelegramSender(Sender):
         except RuntimeError:
             loop = None
         if loop is not None:
-            loop.create_task(self._send(user.id, text))
+            task = loop.create_task(self._send(user.id, text))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
         else:
             asyncio.run(self._send(user.id, text))
 
     async def _send(self, chat_id: str, text: str) -> None:
-        await self._bot.send_message(chat_id=chat_id, text=text)
+        """Доставка в Telegram: сбои не роняют хендлер, но видны в логе."""
+        try:
+            await self._bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            logger.exception("не удалось доставить карточку в chat %s", chat_id)
 
 
 def build_router(service: BotService) -> Any:

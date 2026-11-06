@@ -16,7 +16,15 @@ import pytest
 from adapters.rules.rotation_rule import RotationRule
 from bots.sender import LogSender, MockSender, Sender
 from bots.telegram import bot as bot_module
-from bots.telegram.bot import AlreadyIssued, BotService, NoPair, TelegramSender, get_token
+from bots.telegram.bot import (
+    AlreadyIssued,
+    BotError,
+    BotService,
+    NoPair,
+    NotIssued,
+    TelegramSender,
+    get_token,
+)
 from engine.engine import Engine, NoCardAvailable
 from engine.models import Card, CardStatus, Pair, SourceKind, User
 
@@ -122,16 +130,26 @@ def test_two_user_pair_flow_today_done_rate():
 def test_rate_scale_and_done_order_enforced():
     service = make_service()
     pair_up(service)
-    with pytest.raises(Exception):
+    with pytest.raises(NotIssued):
         service.rate("u2", 5)  # нечего оценивать
     service.today("u1")
-    with pytest.raises(Exception):
+    with pytest.raises(BotError):
         service.rate("u2", "отлично")  # нечисловая оценка
     done_second = service.done("u2")  # /done любым из пары — карточка общая
     assert "/rate" in done_second
     service.rate("u2", 3)
-    with pytest.raises(Exception):
+    with pytest.raises(BotError):
         service.rate("u2", 6)
+
+
+def test_done_twice_rejected_with_not_issued():
+    """Повторный /done после уже отмеченной карточки — ошибка, не двойной учёт."""
+    service = make_service()
+    pair_up(service)
+    service.today("u1")
+    service.done("u1")
+    with pytest.raises(NotIssued):
+        service.done("u1")
 
 
 def test_free_policy_daily_gate_server_decides():
