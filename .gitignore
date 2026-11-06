@@ -5,3 +5,7 @@ __pycache__/
 node_modules/
 *.db
 .superpowers/
+
+# Паки карточек (приватные, вне репозитория)
+packs/
+media/generated/
