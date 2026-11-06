@@ -11,6 +11,8 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY engine/ ./engine/
 COPY adapters/ ./adapters/
+COPY bots/ ./bots/
+COPY tools/ ./tools/
 COPY tests/ ./tests/
 
 RUN pip install --no-cache-dir . pytest

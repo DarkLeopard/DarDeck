@@ -1,14 +1,19 @@
 """Интеграционные тесты бота поверх движка: MockSender, без сети и токена.
 
-Покрытие Task 4:
-- пара юзеров: /pair -> /today (карточка обоим) -> /done -> /rate (лог);
+Покрытие Task 4/7:
+- пара юзеров: /pair -> /today (карточка обоим) -> /done -> /rate (журнал оценок);
+- UGC-проводка: mark_issued после выдачи, /like /dislike /report (антифарм);
 - гейт свободного интервала (DeliveryPolicy: сервер решает, 1/день);
+- премиум-грант: интервал расслабляется (shorter interval becomes possible);
+- снимок оценок пишется JSON-файлом после /rate (DARDECK_RATINGS_SNAPSHOT);
 - dry-run fallback: без DARDECK_BOT_TOKEN -> LogSender instead of TelegramSender;
 - модуль импортируется без токена и без aiogram на верхнем уровне (subprocess).
 """
 
+import json
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -24,9 +29,12 @@ from bots.telegram.bot import (
     NotIssued,
     TelegramSender,
     get_token,
+    ratings_snapshot_path,
 )
 from engine.engine import Engine, NoCardAvailable
 from engine.models import Card, CardStatus, Pair, SourceKind, User
+from engine.ratings import RatingEngine
+from engine.ugc import UgcEngine, grant_premium_day
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -53,14 +61,21 @@ class ListSource:
 
 
 def make_service(sender: Sender | None = None,
-                 cards: list[Card] | None = None) -> BotService:
+                 cards: list[Card] | None = None,
+                 ratings_path: str | None = None) -> BotService:
     deck = cards if cards is not None else [
         make_card("c1", "Спросите партнёра о детстве"),
         make_card("c2", "Свидание на выходные вместе"),
         make_card("c3", "Мечта, о которой вы не рассказывали"),
     ]
     engine = Engine(ListSource(deck), RotationRule())
-    return BotService(engine, sender if sender is not None else MockSender())
+    return BotService(
+        engine,
+        sender if sender is not None else MockSender(),
+        ugc=UgcEngine(),
+        ratings=RatingEngine(),
+        ratings_path=ratings_path,
+    )
 
 
 def pair_up(service: BotService) -> None:
@@ -122,8 +137,9 @@ def test_two_user_pair_flow_today_done_rate():
 
     reply_rate = service.rate("u1", 5)
     assert "учтена" in reply_rate
-    assert service.rating_log == [
-        {"pair_id": pair.id, "card_id": "c1", "user_id": "u1", "score": 5}
+    # оценка 1..5 маппится в журнал RatingEngine (+1/0/-1), 5 -> +1
+    assert service._ratings.to_records() == [
+        {"card_id": "c1", "user_id": "u1", "value": 1, "text": None}
     ]
 
 
@@ -161,6 +177,34 @@ def test_free_policy_daily_gate_server_decides():
         service.today("u1")
     with pytest.raises(AlreadyIssued):
         service.today("u2")  # карточка пара, а не юзера
+
+
+def test_premium_grant_relaxes_interval_for_that_pair():
+    """Грант премиум-дня: интервал пары расслабляется — выдача раньше суток.
+
+    Free-пара против той же задержки — по-прежнему AlreadyIssued.
+    """
+    service = make_service(cards=[
+        make_card("c1", "Первая"),
+        make_card("c2", "Вторая"),
+    ])
+    pair_up(service)
+    now = datetime(2026, 11, 6, 12, 0, 0)
+
+    service.today("u1", now)
+    pair = service.pair_for("u1")
+    later = now + timedelta(hours=1, seconds=1)  # больше премиум-минимума, меньше суток
+
+    # контроль: без премиума интервал свободного режима не менялся
+    free_service = make_service(cards=[make_card("f1", "Свободная")])
+    pair_up(free_service)
+    free_service.today("u1", now)
+    with pytest.raises(AlreadyIssued):
+        free_service.today("u1", later)
+
+    grant_premium_day(pair.user_a, now=now)  # например, автопромоушен UGC
+    reply = service.today("u2", later)  # премиум-пара: выдача раньше суток возможна
+    assert "Карточка дня" in reply
 
 
 def test_no_cards_left_maps_to_engine_error():
@@ -206,7 +250,156 @@ def test_log_sender_dry_run_replaces_sending(monkeypatch, caplog):
     assert len(sender.records) == 2
     assert sender.records == [("u1", "c1"), ("u2", "c1")]
     assert "dry-run" in caplog.text
-    assert service.rating_log[0]["score"] == 5
+    assert service._ratings.to_records()[0]["value"] == 1
+
+
+# -- UGC-проводка: mark_issued + /like /dislike /report ------------------------
+
+
+def test_today_marks_issued_receivers_to_ugc():
+    """После /today получатели карточки зарегистрированы в UGC (антифарм)."""
+    service = make_service()
+    pair_up(service)
+    service.today("u1")
+    card = service._last_card[service.pair_for("u1").id]
+    receivers = service._ugc.state.issued_to[card.id]
+    assert receivers == {"u1", "u2"}
+
+
+def test_like_dislike_report_on_last_issued_card():
+    service = make_service(cards=[make_card("c1", "Прогулка в парке")])
+    pair_up(service)
+    service.today("u1")
+    card_id = service._last_card[service.pair_for("u1").id].id
+
+    assert "Лайк учтён" in service.like("u1")
+    assert "Дизлайк учтён" in service.dislike("u2")
+    assert "Жалоба отправлена" in service.report("u1")
+    assert service._ugc.state.like_count(card_id) == 1
+    assert service._ugc.state.dislike_count(card_id) == 1
+    assert service._ugc.state.report_count(card_id) == 1
+
+
+def test_like_targets_card_by_text_substring():
+    """Аргумент /like — подстрока текста: выбираем одну из выданных карточек пары."""
+    service = make_service()
+    pair_up(service)
+    service.today("u1")
+    with pytest.raises(AlreadyIssued):
+        service.today("u1")  # интервал свободного режима ещё не прошёл
+    # выдача второй карточки принудительно (минуя гейт), чтобы было из чего выбирать
+    card2 = make_card("c2", "Свидание на выходные вместе")
+    pair = service.pair_for("u1")
+    service._ugc.state.cards[card2.id] = card2  # как в today(): реестр UGC-состояния
+    service._issued[pair.id].append(card2)
+    service._ugc.mark_issued(pair, card2)
+
+    service.like("u1", "Свидание")
+    assert service._ugc.state.like_count("c2") == 1
+    assert service._ugc.state.like_count("c1") == 0
+
+
+def test_like_without_card_raises_not_issued():
+    service = make_service()
+    pair_up(service)
+    with pytest.raises(NotIssued):
+        service.like("u1")
+    with pytest.raises(NotIssued):
+        service.report("u1")
+
+
+def test_double_vote_mapped_to_friendly_error():
+    service = make_service()
+    pair_up(service)
+    service.today("u1")
+    service.like("u1")
+    with pytest.raises(BotError, match="уже голосовали"):
+        service.like("u1")
+    with pytest.raises(BotError, match="уже голосовали"):
+        service.dislike("u1")
+
+
+def test_unknown_substring_mapped_to_friendly_error():
+    service = make_service()
+    pair_up(service)
+    service.today("u1")
+    with pytest.raises(NotIssued, match="такого текста нет"):
+        service.like("u1", "несуществующий текст")
+
+
+# -- /rate: маппинг шкалы 1..5 -> +1/0/-1 и снимок журнала ---------------------
+
+
+def test_rate_scale_maps_5_3_1(monkeypatch):
+    """Шкала бота 1..5 маппится в журнал +1/0/-1: 5->+1, 3->0, 1->-1."""
+    monkeypatch.delenv(bot_module.RATINGS_SNAPSHOT_ENV, raising=False)
+    service = make_service()
+    pair_up(service)
+    service.today("u1")
+    pair = service.pair_for("u1")
+    service.rate("u1", 5)  # 5 -> +1, и одну оценку на карточку юзер ставит один раз
+
+    card2, card3 = make_card("c2", "Свидание на выходные"), make_card("c3", "Третья")
+    service._issued[pair.id].extend([card2, card3])
+    service._last_card[pair.id] = card3  # нейтральная — на c3
+    service.rate("u2", 3)
+    service._last_card[pair.id] = card2  # негативная — на c2
+    service.rate("u2", 1)
+
+    by_card: dict[str, dict[str, int]] = {}
+    for record in service._ratings.to_records():
+        by_card.setdefault(record["card_id"], {})[record["user_id"]] = record["value"]
+    assert by_card["c1"] == {"u1": 1}
+    assert by_card["c2"] == {"u2": -1}
+    assert by_card["c3"] == {"u2": 0}
+
+
+def test_rate_twice_same_user_rejected_friendly():
+    """Повторная оценка той же карточки тем же юзером — одна на юзера (RatingEngine)."""
+    service = make_service()
+    pair_up(service)
+    service.today("u1")
+    service.rate("u1", 4)
+    with pytest.raises(BotError, match="оценк"):
+        service.rate("u1", 2)  # изменять оценку нельзя: одна на юзера
+
+
+def test_rate_beyond_scale_errors():
+    service = make_service()
+    pair_up(service)
+    service.today("u1")
+    with pytest.raises(BotError):
+        service.rate("u1", "отлично")
+    with pytest.raises(BotError):
+        service.rate("u1", 6)
+
+
+def test_rate_dumps_ratings_snapshot(monkeypatch, tmp_path):
+    """После /rate журнал выгружается в JSON по DARDECK_RATINGS_SNAPSHOT."""
+    snapshot = tmp_path / "ratings.json"
+    monkeypatch.setenv(bot_module.RATINGS_SNAPSHOT_ENV, str(snapshot))
+    service = make_service(ratings_path=ratings_snapshot_path("dardeck.db"))
+    pair_up(service)
+    service.today("u1")
+    service.rate("u1", 5)
+
+    records = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert records == [
+        {"card_id": "c1", "user_id": "u1", "value": 1, "text": None}
+    ]
+
+
+def test_default_ratings_path_beside_db_file(monkeypatch):
+    """Снимок по умолчанию — рядом с файлом БД; env DARDECK_RATINGS_SNAPSHOT сильнее."""
+    monkeypatch.delenv(bot_module.RATINGS_SNAPSHOT_ENV, raising=False)
+    monkeypatch.delenv(bot_module.DB_PATH_ENV, raising=False)
+    assert bot_module.default_db_path() == "dardeck.db"
+    assert bot_module.default_ratings_path("dardeck.db") == "ratings.json"
+    assert bot_module.default_ratings_path("data/deck.sqlite") == str(
+        Path("data") / "ratings.json"
+    )
+    monkeypatch.setenv(bot_module.RATINGS_SNAPSHOT_ENV, "custom.json")
+    assert ratings_snapshot_path("any.db") == "custom.json"
 
 
 def test_module_imports_without_token_and_without_aiogram_top_level():
@@ -230,16 +423,16 @@ def test_module_imports_without_token_and_without_aiogram_top_level():
     assert proc.stdout.strip() == "ok"
 
 
-def test_router_registers_five_commands():
+def test_router_registers_eight_commands():
     aiogram = pytest.importorskip("aiogram")
     from aiogram.filters import Command, CommandStart
 
     router = bot_module.build_router(make_service())
     handlers = router.message.handlers
-    assert len(handlers) == 5
+    assert len(handlers) == 8
     filter_objects = [f for h in handlers for f in getattr(h, "filters", [])]
     # фильтры обёрнуты в FilterObject — сам Command лежит в .callback
     inner = [f.callback for f in filter_objects]
     commands = [c for f in inner for c in getattr(f, "commands", [])]
-    assert commands == ["start", "pair", "today", "done", "rate"]
+    assert commands == ["start", "pair", "today", "done", "rate", "like", "dislike", "report"]
     assert any(isinstance(f, CommandStart) for f in inner)

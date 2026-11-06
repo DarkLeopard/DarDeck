@@ -6,7 +6,7 @@ from datetime import timedelta
 import pytest
 
 from engine.engine import Engine, NoCardAvailable, PairState, SPONSORED_CYCLE
-from engine.models import Card, CardStatus, Pair, SourceKind, User
+from engine.models import Card, CardStatus, CardVisibility, Pair, SourceKind, User
 from engine.policy import DeliveryPolicy
 
 
@@ -142,6 +142,53 @@ def test_draft_and_retired_ugc_are_not_issued():
         engine.issue_card(pair)
     state = engine.pair_state(pair)
     assert "Черновик" not in state.history and "Отставлена" not in state.history
+
+
+# -- private UGC: паре автора — да (draft включительно), чужим парам — нет -----
+
+
+def make_ugc(cid: str, text: str, author_id: str | None, status: CardStatus) -> Card:
+    """UGC-карточка с автором: private-видимость по умолчанию."""
+    return Card(
+        id=cid,
+        theme="t",
+        text=text,
+        source=SourceKind.UGC,
+        author_id=author_id,
+        visibility=CardVisibility.PRIVATE,
+        status=status,
+    )
+
+
+def test_author_pair_receives_own_private_card_regardless_of_draft():
+    """Решение по private-истории: приватную карточку автора паре автора выдать можно."""
+    own_pair = Pair(id="p1", user_a=make_user("a"), user_b=make_user("b"))
+    for status in (CardStatus.DRAFT, CardStatus.POOL):
+        card = make_ugc("priv", "Личная", "a", status)
+        engine = Engine(FakeSource([card]), FirstRule())
+        assert engine.issue_card(own_pair).id == "priv"
+
+
+def test_other_pair_does_not_receive_private_card():
+    """Чужим парам private-черновик (авторская исключение) не выдаётся."""
+    deck = [
+        make_card("seed1", "Сид", source=SourceKind.SEED),
+        make_ugc("priv", "Личная", "a", CardStatus.DRAFT),
+    ]
+    engine = Engine(FakeSource(deck), FirstRule())
+    other_pair = Pair(id="p2", user_a=make_user("x"), user_b=make_user("y"))
+    assert engine.issue_card(other_pair).id == "seed1"  # только seed
+    with pytest.raises(NoCardAvailable):
+        engine.issue_card(other_pair)  # чужая private недоступна
+
+
+def test_retired_private_card_not_issued_even_to_author_pair():
+    """Retired снят пост-модерацией: приватная карточка автора больше не выдаётся."""
+    card = make_ugc("priv", "Личная", "a", CardStatus.RETIRED)
+    engine = Engine(FakeSource([card]), FirstRule())
+    own_pair = Pair(id="p1", user_a=make_user("a"), user_b=make_user("b"))
+    with pytest.raises(NoCardAvailable):
+        engine.issue_card(own_pair)
 
 
 def test_exhaustion_raises_when_all_shown():

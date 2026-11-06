@@ -12,8 +12,9 @@ dev = [
     "pytest",
 ]
 
-[tool.setuptools]
-packages = ["engine"]
+# Все пакеты рантайма: ядро, адаптеры (db/rules — подпакеты), бот, CLI-инструменты.
+[tool.setuptools.packages.find]
+include = ["engine*", "adapters*", "bots*", "tools*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

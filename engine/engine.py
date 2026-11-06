@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from .interfaces import CardSource, RulePlugin
-from .models import Card, CardStatus, Pair, SourceKind
+from .models import Card, CardStatus, CardVisibility, Pair, SourceKind
 from .policy import DeliveryPolicy
 
 # Капа спонсорских: ≤1 на N показов в паре.
@@ -35,9 +35,20 @@ class PairState:
     sponsored_window: deque[bool] = field(default_factory=lambda: deque(maxlen=SPONSORED_CYCLE - 1))
 
 
-def _is_eligible(card: Card) -> bool:
-    """К выдаче пригодны seed-карточки и UGC-карточки в пуле; draft/retired — нет."""
-    return card.source == SourceKind.SEED or card.status == CardStatus.POOL
+def _is_eligible(card: Card, pair: Pair) -> bool:
+    """К выдаче пригодны seed-карточки и UGC-карточки в пуле; draft/retired — нет.
+
+    Исключение (решение по private-истории UGC): приватную карточку автора можно
+    выдать паре автора независимо от статуса draft — автор видит свою карточку
+    до промоушена; чужим парам private-черновики недоступны, как и прежде.
+    """
+    if card.source == SourceKind.SEED or card.status == CardStatus.POOL:
+        return True
+    return (
+        card.status is not CardStatus.RETIRED
+        and card.visibility is CardVisibility.PRIVATE
+        and card.author_id in {u.id for u in pair.users}
+    )
 
 
 class Engine:
@@ -67,7 +78,7 @@ class Engine:
         candidates = self._source.fetch_candidates(pair, self._policy)
         seen = set(state.history)
 
-        eligible = [c for c in candidates if _is_eligible(c) and c.text not in seen]
+        eligible = [c for c in candidates if _is_eligible(c, pair) and c.text not in seen]
         if not self._sponsored_allowed(state):
             eligible = [c for c in eligible if not c.is_sponsored]
         if not eligible:
