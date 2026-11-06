@@ -9,3 +9,4 @@ node_modules/
 # Паки карточек (приватные, вне репозитория)
 packs/
 media/generated/
+.superpowers/
