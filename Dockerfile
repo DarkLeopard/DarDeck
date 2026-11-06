@@ -10,6 +10,7 @@ WORKDIR /app
 # Зависимости берём из pyproject.toml; pytest — dev-инструмент, ставим рядом.
 COPY pyproject.toml ./
 COPY engine/ ./engine/
+COPY adapters/ ./adapters/
 COPY tests/ ./tests/
 
 RUN pip install --no-cache-dir . pytest

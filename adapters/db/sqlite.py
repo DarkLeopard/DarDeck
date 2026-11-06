@@ -146,7 +146,13 @@ class SqliteCardSource:
         self._conn.commit()
 
     def mark_completed(self, pair: Pair, card: Card | str, now: datetime | None = None) -> None:
-        """Отметить завершение: последний незакрытый показ этой карточки паре."""
+        """Отметить завершение показа карточки паре.
+
+        SQL закрывает ВСЕ незакрытые показы этой пары с этой карточкой
+        (UPDATE ... WHERE completed_at IS NULL без ограничения по issued_at).
+        issued_at имеет точность 1 секунду, поэтому повторные выдачи одной
+        карточки в ту же секунду вливаются в одну строку (INSERT OR IGNORE).
+        """
         card_id = card.id if isinstance(card, Card) else card
         completed_at = (now or datetime.now()).isoformat(timespec="seconds")
         self._conn.execute(
