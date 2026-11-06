@@ -254,7 +254,7 @@ class BotService:
         """«Мои карточки» — последние до 3 выданных юзеру (кратко, с идентификатором)."""
         cards = self._issued_to.get(user_id, [])[-MY_CARDS_LIMIT:]
         if not cards:
-            raise NotIssued("Пока нет ваших карточек — нажмите «🎲 Дать фант».")
+            raise NotIssued(f"Пока нет ваших карточек — нажмите «{FANT_BUTTON_TEXT}».")
         lines = []
         for num, card in enumerate(cards, 1):
             text = (
@@ -268,7 +268,7 @@ class BotService:
     def help_text(self) -> str:
         """/help («Помощь») — шпаргалка по кнопкам и командам."""
         return (
-            "Меню: кнопка «🎲 Дать фант» — новая карточка (solo или паре), "
+            "Меню: кнопка «" + FANT_BUTTON_TEXT + "» — новая карточка (solo или паре), "
             "«Мои карточки» — последние до 3 выданных, /pair — соединить пару.\n"
             "На сообщении-карточке есть кнопки: ✅ Выполнено, ⭐ Оценить (1..5), "
             "после выполнения — 👍 / 👎 / ⚠ Report.\n"

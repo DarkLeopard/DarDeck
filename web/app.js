@@ -153,7 +153,8 @@
     cardTitle.textContent = card.title;
     cardText.textContent = card.text;
     cardMeta.textContent =
-      "Дека: DarDeck Dark · " + card.category + " · #" + card.id.replace("seed-", "");
+      "Дека: DarDeck Dark · " + card.category + " · #" +
+      card.id.replace(/^seed-|^mock-/, "");
     cardFeedback.textContent = "";
   }
 
@@ -193,35 +194,25 @@
   const historyList = document.getElementById("history-list");
 
   function renderHistory() {
-    const byId = new Map(MOCK_CARDS.map((c) => [c.id, c]));
     historyList.innerHTML = "";
     for (const entry of MOCK_HISTORY) {
-      const card = byId.get(entry.cardId);
       const li = document.createElement("li");
 
       const date = document.createElement("span");
       date.className = "history-date";
       date.textContent = entry.date;
 
+      // Заглушка: entry.title уже готовый заголовок («Заглушка A»); мок-карты
+      // не совпадают с history по id, поэтому отдельного lookup нет.
       const title = document.createElement("span");
-      if (entry.status === "skipped") {
-        title.className = "history-title history-skipped";
-        title.textContent = "⏭ " + (card ? card.title : "пропущено");
-      } else {
-        title.className = "history-title";
-        title.textContent = "✅ " + (card ? card.title : "—");
-      }
+      title.className = "history-title";
+      title.textContent = entry.title;
 
-      const rating = document.createElement("span");
-      if (entry.rating) {
-        rating.className = "history-rating";
-        rating.textContent = entry.rating;
-      } else {
-        rating.className = "history-rating history-none";
-        rating.textContent = "—";
-      }
+      const verdict = document.createElement("span");
+      verdict.className = "history-rating";
+      verdict.textContent = entry.verdict;
 
-      li.append(date, title, rating);
+      li.append(date, title, verdict);
       historyList.append(li);
     }
   }

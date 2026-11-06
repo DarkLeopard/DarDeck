@@ -2,6 +2,9 @@
 // Заглушки: реальные паки хранятся ПРИВАТНО (packs/ вне репозитория, см. README).
 // TODO(mvp3): заменить на API движка (+ initData-валидация, см. docs/miniapp-research.md §7).
 
+// Кулдаун после взятия фанта (сек) — читается в app.js.
+const MOCK_COOLDOWN_SECONDS = 47;
+
 const MOCK_CARDS = [
   { id: "mock-1", theme: "dark", title: "Заглушка A", category: "Повседневные",
     text: "Пример текста карточки-заглушки: короткое задание на заботу в паре." },
