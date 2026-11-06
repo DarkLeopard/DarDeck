@@ -7,14 +7,20 @@
 - премиум-грант: интервал расслабляется (shorter interval becomes possible);
 - снимок оценок пишется JSON-файлом после /rate (DARDECK_RATINGS_SNAPSHOT);
 - dry-run fallback: без DARDECK_BOT_TOKEN -> LogSender instead of TelegramSender;
-- модуль импортируется без токена и без aiogram на верхнем уровне (subprocess).
+- модуль импортируется без токена и без aiogram на верхнем уровне (subprocess);
+- кнопки (Task 9): reply-клавиатура меню, inline-кнопки карточки с
+  callback_data 'act:<action>:<card_id>', callback-флоу через BotService,
+  «Мои карточки» (последние до 3).
 """
 
+import asyncio
 import json
 import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -425,19 +431,20 @@ def test_module_imports_without_token_and_without_aiogram_top_level():
     assert proc.stdout.strip() == "ok"
 
 
-def test_router_registers_ten_commands_with_fant_and_id():
+def test_router_registers_commands_with_menu_buttons():
     aiogram = pytest.importorskip("aiogram")
     from aiogram.filters import Command, CommandStart
 
     router = bot_module.build_router(make_service())
     handlers = router.message.handlers
-    assert len(handlers) == 11  # 10 команд + хендлер кнопки «Дать фант»
+    assert len(handlers) == 14  # 11 команд + кнопки «Дать фант»/«Помощь»/«Мои карточки»
+    assert len(router.callback_query.handlers) == 1  # inline-кнопки карточки
     filter_objects = [f for h in handlers for f in getattr(h, "filters", [])]
     # фильтры обёрнуты в FilterObject — сам Command лежит в .callback
     inner = [f.callback for f in filter_objects]
     commands = [c for f in inner for c in getattr(f, "commands", [])]
     assert commands == [
-        "start", "pair", "fant", "today", "id",
+        "start", "pair", "fant", "today", "id", "help",
         "done", "rate", "like", "dislike", "report",
     ]
     assert any(isinstance(f, CommandStart) for f in inner)
@@ -560,3 +567,299 @@ def test_today_without_pair_after_fant_uses_solo_pair():
     # после соло-выдачи /today тоже работает на той же self-паре (гейт сработает)
     with pytest.raises(AlreadyIssued):
         service.today("u1")
+
+
+# -- Task 9: кнопки (reply/inline), callback-флоу, «Мои карточки» ----------------
+
+
+class StubMessage:
+    """Обычное сообщение для прямого вызова хендлера роутера."""
+
+    def __init__(self, user_id: str, text: str) -> None:
+        self.from_user = SimpleNamespace(id=user_id, username=None)
+        self.text = text
+        self.answers: list[tuple[str, Any]] = []
+
+    async def answer(self, text: str, reply_markup: Any = None) -> None:
+        self.answers.append((text, reply_markup))
+
+
+class StubCardMessage:
+    """Сообщение-карточка: у него обновляют inline-разметку (edit_reply_markup)."""
+
+    def __init__(self) -> None:
+        self.markups: list[Any] = []
+
+    async def edit_reply_markup(self, reply_markup: Any = None) -> None:
+        self.markups.append(reply_markup)
+
+
+class StubCallback:
+    """CallbackQuery-заглушка: data + message + answer_callback_query."""
+
+    def __init__(self, user_id: str, data: str | None,
+                 message: StubCardMessage | None = None) -> None:
+        self.from_user = SimpleNamespace(id=user_id)
+        self.data = data
+        self.message = message
+        self.answered: list[tuple[str | None, bool]] = []
+
+    async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
+        self.answered.append((text, show_alert))
+
+
+class StubBot:
+    """aiogram.Bot-подмена: фиксирует kwargs send_message (без сети)."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def send_message(self, chat_id: str, text: str,
+                           reply_markup: Any = None) -> None:
+        self.calls.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup})
+
+
+def handler_fn(router: Any, name: str, pool: str = "message") -> Any:
+    """Хендлер роутера по имени функции (для прямого вызова на стабах)."""
+    obj_pool = router.message if pool == "message" else router.callback_query
+    for h in obj_pool.handlers:
+        if h.callback.__name__ == name:
+            return h.callback
+    pytest.fail(f"хендлер {name} не зарегистрирован в роутере")
+
+
+def run_handler(coro: Any) -> None:
+    """Асинхронный вызов хендлера + дожидание fire-and-forget задач Sender'а."""
+    async def run() -> None:
+        await coro
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        if pending:
+            await asyncio.wait(pending)
+
+    asyncio.run(run())
+
+
+def button_texts(markup: Any) -> list[list[str]]:
+    """Тексты кнопок клавиатуры построчно (reply или inline)."""
+    rows = markup.keyboard if hasattr(markup, "keyboard") else markup.inline_keyboard
+    return [[btn.text for btn in row] for row in rows]
+
+
+def callback_datas(markup: Any) -> list[list[str]]:
+    """callback_data кнопок inline-клавиатуры построчно."""
+    return [[btn.callback_data for btn in row] for row in markup.inline_keyboard]
+
+
+def test_main_menu_kb_and_inline_keyboards_shape_expectations():
+    """Конструкторы клавиатур: маленькие функции с проверяемым набором кнопок."""
+    pytest.importorskip("aiogram")
+
+    assert button_texts(bot_module.main_menu_kb()) == [
+        ["🎲 Дать фант"],
+        ["Мои карточки", "Помощь"],
+    ]
+    card = bot_module.card_kb("c1")
+    assert button_texts(card) == [["✅ Выполнено", "⭐ Оценить"]]
+    assert callback_datas(card) == [["act:done:c1", "act:rate:c1"]]
+
+    rate = bot_module.rate_kb("c1")
+    assert button_texts(rate) == [["1", "2", "3", "4", "5"]]
+    assert callback_datas(rate) == [[
+        "act:rate1:c1", "act:rate2:c1", "act:rate3:c1", "act:rate4:c1", "act:rate5:c1",
+    ]]
+
+    reaction = bot_module.reaction_kb("c1")
+    assert button_texts(reaction) == [["👍", "👎"], ["⚠ Report"]]
+    assert callback_datas(reaction) == [["act:like:c1", "act:dislike:c1"], ["act:report:c1"]]
+
+
+def test_start_answers_with_main_menu_reply_keyboard():
+    """/start — reply-клавиатура главного меню из трёх кнопок."""
+    pytest.importorskip("aiogram")
+    router = bot_module.build_router(make_service())
+    message = StubMessage("u1", "/start")
+    run_handler(handler_fn(router, "cmd_start")(message))
+
+    assert "Привет" in message.answers[0][0]
+    assert button_texts(message.answers[0][1]) == [
+        ["🎲 Дать фант"],
+        ["Мои карточки", "Помощь"],
+    ]
+
+
+def test_telegram_sender_sends_card_with_inline_done_rate():
+    """Sender-доставка карточки: сообщение несёт inline [✅ Выполнено][⭐ Оценить]."""
+    pytest.importorskip("aiogram")
+    stub = StubBot()
+    sender = bot_module.TelegramSender(stub)
+    card = make_card("c1", "Спросите партнёра о детстве")
+    run_handler(sender._send("555", card))
+
+    assert len(stub.calls) == 1
+    call = stub.calls[0]
+    assert call["chat_id"] == "555"
+    assert call["text"] == bot_module.format_card(card)
+    assert button_texts(call["reply_markup"]) == [["✅ Выполнено", "⭐ Оценить"]]
+    assert callback_datas(call["reply_markup"]) == [["act:done:c1", "act:rate:c1"]]
+
+
+def test_solo_fant_full_flow_card_with_inline_buttons_and_menu():
+    """Соло-флоу через роутер: карточка с inline-кнопками, ответ — с меню."""
+    pytest.importorskip("aiogram")
+    stub = StubBot()
+    service = make_service(sender=bot_module.TelegramSender(stub))
+    router = bot_module.build_router(service)
+    message = StubMessage("u1", "/fant")
+    run_handler(handler_fn(router, "cmd_fant")(message))
+
+    # карточка доставлена одним сообщением с inline-кнопками
+    assert len(stub.calls) == 1
+    markup = stub.calls[0]["reply_markup"]
+    assert button_texts(markup) == [["✅ Выполнено", "⭐ Оценить"]]
+    assert callback_datas(markup) == [["act:done:c1", "act:rate:c1"]]
+    # сопроводительный ответ идёт с reply-клавиатурой главного меню
+    assert button_texts(message.answers[0][1]) == [
+        ["🎲 Дать фант"], ["Мои карточки", "Помощь"],
+    ]
+
+
+def test_solo_callback_flow_done_rate_like():
+    """Callback-флоу: done -> подтверждение + реакции; rate 4 -> +1 в журнале."""
+    pytest.importorskip("aiogram")
+    service = make_service()
+    service.start("u1", "ann")
+    service.fant("u1", "ann")
+    router = bot_module.build_router(service)
+    on_callback = handler_fn(router, "on_callback", pool="callback_query")
+    card_msg = StubCardMessage()
+
+    done = StubCallback("u1", "act:done:c1", message=card_msg)
+    run_handler(on_callback(done))
+    assert "молодец" in done.answered[0][0]
+    assert not done.answered[0][1]  # успех — без алерта, спиннер погашен
+    state = service._engine.pair_state(service._solo_pairs["u1"])
+    assert state.completed == {"c1"}
+    # после выполнения появились [👍][👎][⚠ Report]
+    assert callback_datas(card_msg.markups[-1]) == [
+        ["act:like:c1", "act:dislike:c1"], ["act:report:c1"],
+    ]
+
+    # ⭐ Оценить -> второй экран 1..5
+    screen = StubCallback("u1", "act:rate:c1", message=card_msg)
+    run_handler(on_callback(screen))
+    assert callback_datas(card_msg.markups[-1]) == [[
+        f"act:rate{n}:c1" for n in range(1, 6)
+    ]]
+    assert "1 до 5" in screen.answered[0][0]
+
+    rate4 = StubCallback("u1", "act:rate4:c1", message=card_msg)
+    run_handler(on_callback(rate4))
+    assert "учтена" in rate4.answered[0][0]
+    # 4 -> +1 (маппинг волны-1), оценка приписана карточке callback'ом
+    assert service._ratings.to_records() == [
+        {"card_id": "c1", "user_id": "u1", "value": 1, "text": None}
+    ]
+
+    like = StubCallback("u1", "act:like:c1", message=card_msg)
+    run_handler(on_callback(like))
+    assert "Лайк учтён" in like.answered[0][0]
+    assert service._ugc.state.like_count("c1") == 1
+
+
+def test_double_done_callback_friendly_no_crash():
+    """Повторный done по кнопке: дружелюбный ответ, без исключения."""
+    pytest.importorskip("aiogram")
+    service = make_service()
+    service.start("u1", "ann")
+    service.fant("u1", "ann")
+    router = bot_module.build_router(service)
+    on_callback = handler_fn(router, "on_callback", pool="callback_query")
+    card_msg = StubCardMessage()
+
+    run_handler(on_callback(StubCallback("u1", "act:done:c1", message=card_msg)))
+    double = StubCallback("u1", "act:done:c1", message=card_msg)
+    run_handler(on_callback(double))  # не бросает
+    text, show_alert = double.answered[0]
+    assert "уже отмечена выполненной" in text
+    assert show_alert  # ошибки — алертом
+
+
+def test_unknown_callback_data_friendly_error_no_crash():
+    """Неизвестный/битый callback_data: friendly error, без падения."""
+    pytest.importorskip("aiogram")
+    service = make_service()
+    service.start("u1", "ann")
+    service.fant("u1", "ann")
+    router = bot_module.build_router(service)
+    on_callback = handler_fn(router, "on_callback", pool="callback_query")
+
+    for data in ("act:zoom:c1", "garbage", "act:done:"):
+        cq = StubCallback("u1", data)
+        run_handler(on_callback(cq))  # не бросает
+        text, show_alert = cq.answered[0]
+        assert show_alert
+        assert "возьмите новую карточку" in text
+    # после мусора состояние не изменилось: карточка не выполнена
+    state = service._engine.pair_state(service._solo_pairs["u1"])
+    assert state.completed == set()
+
+
+def test_callback_rate9_is_unknown_action_not_score():
+    """'rate9' не оценка и не экран: friendly unknown, оценка не ставится."""
+    pytest.importorskip("aiogram")
+    service = make_service()
+    service.start("u1", "ann")
+    service.fant("u1", "ann")
+    router = bot_module.build_router(service)
+    on_callback = handler_fn(router, "on_callback", pool="callback_query")
+    cq = StubCallback("u1", "act:rate9:c1")
+    run_handler(on_callback(cq))
+    assert "возьмите новую карточку" in cq.answered[0][0]
+    assert service._ratings.to_records() == []
+
+
+def test_callback_without_any_card_friendly():
+    """Callback до всякой выдачи: friendly, без падения (нет соло/пары)."""
+    pytest.importorskip("aiogram")
+    service = make_service()
+    router = bot_module.build_router(service)
+    on_callback = handler_fn(router, "on_callback", pool="callback_query")
+    cq = StubCallback("u1", "act:done:c1")
+    run_handler(on_callback(cq))
+    assert cq.answered[0][1]  # alert
+
+
+def test_my_cards_lists_upto_three_latest():
+    """«Мои карточки»: последние до 3 выданных юзеру, кратко, с идентификатором."""
+    deck = [make_card(f"c{n}", f"Карточка номер {n}") for n in range(1, 6)]
+    service = make_service(cards=deck,
+                           test_users=bot_module.parse_test_user_ids("111"))
+    service.start("111", "owner")
+    for _ in range(5):  # whitelist: гейт обходится, выдаём подряд c1..c5
+        service.fant("111", "owner")
+
+    reply = service.my_cards("111")
+    lines = reply.strip().splitlines()[1:]  # без заголовка
+    assert len(lines) == 3  # только последние три
+    assert "#c3" in lines[0] and "#c4" in lines[1] and "#c5" in lines[2]
+    assert "#c1" not in reply and "#c2" not in reply
+
+
+def test_my_cards_long_text_snipped():
+    """Длинный текст карточки в «Моих карточках» — краткий сниппет (48 символов + …)."""
+    deck = [make_card("c1", "длинный" * 20)]
+    service = make_service(cards=deck)
+    service.start("u1", "ann")
+    service.fant("u1", "ann")
+    reply = service.my_cards("u1")
+    assert "#c1" in reply
+    assert reply.count("длинный") == 6  # 48 = 6 слов по 8 символов
+    assert reply.rstrip().endswith("…")
+
+
+def test_my_cards_empty_is_friendly():
+    """Нет выданных карточек: friendly BotError, обработчик отвечает без стека."""
+    service = make_service()
+    service.start("u1", "ann")
+    with pytest.raises(BotError, match="Дать фант"):
+        service.my_cards("u1")

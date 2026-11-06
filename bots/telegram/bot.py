@@ -12,7 +12,11 @@
   поверх последней выданной карточки пары (голос — у каждого участника);
 - RatingEngine: журнал оценок /rate (4-5 -> +1, 3 -> 0, 1-2 -> -1), снимок
   журнала пишется JSON-файлом после каждой оценки (DARDECK_RATINGS_SNAPSHOT);
-- Sender: доставка карточки юзеру. Токен — только env DARDECK_BOT_TOKEN;
+- Кнопки (Task 9): главное меню reply-keyboard на /start (Мои карточки =
+  последние до 3 выданных), карточка несёт inline-кнопки
+  callback_data 'act:<action>:<card_id>'; спиннер гасится всегда;
+- Sender: доставка карточки юзеру с inline-кнопками карточки. Токен — только
+  env DARDECK_BOT_TOKEN;
   без токена бот в dry-run (LogSender пишет в лог вместо отправки).
 
 aiogram импортируется ленивый (внутри функций): модуль импортируется без
@@ -55,7 +59,32 @@ RATINGS_SNAPSHOT_ENV = "DARDECK_RATINGS_SNAPSHOT"
 TEST_USER_IDS_ENV = "DARDECK_TEST_USER_IDS"
 DEFAULT_DB_PATH = "dardeck.db"  # по умолчанию файл (не :memory:) — персистентность
 RATINGS_SNAPSHOT_FILE = "ratings.json"  # снимок оценок рядом с файлом БД
-FANT_BUTTON_TEXT = "Дать фант"  # кнопка клавиатуры — алиас /fant (Task 8, solo)
+# -- кнопки: главное меню (reply-клавиатура, Task 9) ----------------------------
+FANT_BUTTON_TEXT = "🎲 Дать фант"  # кнопка клавиатуры — алиас /fant (Task 8, solo)
+CARDS_BUTTON_TEXT = "Мои карточки"  # последние до 3 выданных юзеру карточек
+HELP_BUTTON_TEXT = "Помощь"
+
+# кнопки карточки (inline; callback_data = callback_of(action, card_id))
+DONE_BUTTON_TEXT = "✅ Выполнено"
+RATE_BUTTON_TEXT = "⭐ Оценить"
+LIKE_BUTTON_TEXT = "👍"
+DISLIKE_BUTTON_TEXT = "👎"
+REPORT_BUTTON_TEXT = "⚠ Report"
+
+CB_PREFIX = "act"  # callback_data = 'act:<action>:<card_id>'
+CB_DONE = "done"
+CB_RATE = "rate"  # открывает экран оценки (кнопки 1..5 -> 'act:rate<n>:<id>')
+CB_LIKE = "like"
+CB_DISLIKE = "dislike"
+CB_REPORT = "report"
+
+MY_CARDS_LIMIT = 3  # «Мои карточки»: последние до 3 выданных
+CARD_SNIPPET_MAX = 48  # краткая строка текста карточки в списке
+
+STALE_BUTTON = f"Эта кнопка устарела — возьмите новую карточку «{FANT_BUTTON_TEXT}»."
+UNKNOWN_BUTTON = f"Не понял кнопку — возьмите новую карточку «{FANT_BUTTON_TEXT}»."
+RATE_PROMPT = "Оцените карточку: цифра от 1 до 5 — кнопки ниже."
+NO_CARDS_YET = "Новых карточек пока нет — попробуйте позже."
 
 logger = logging.getLogger("dardeck.bots")
 
@@ -146,6 +175,7 @@ class BotService:
         self._pending: list[str] = []  # юзеры в ожидании спаривания
         self._last_card: dict[str, Card] = {}  # pair_id -> последняя выданная карточка
         self._issued: dict[str, list[Card]] = {}  # pair_id -> выданные карточки (по порядку)
+        self._issued_to: dict[str, list[Card]] = {}  # user_id -> выданные юзеру карточки
         self._last_issue_at: dict[str, datetime] = {}  # pair_id -> момент последней выдачи
 
 
@@ -219,6 +249,31 @@ class BotService:
     def show_id(self, user_id: str) -> str:
         """/id — показать свой Telegram ID (всем юзерам, без секретов кроме id)."""
         return f"Ваш Telegram ID: {user_id}"
+
+    def my_cards(self, user_id: str) -> str:
+        """«Мои карточки» — последние до 3 выданных юзеру (кратко, с идентификатором)."""
+        cards = self._issued_to.get(user_id, [])[-MY_CARDS_LIMIT:]
+        if not cards:
+            raise NotIssued("Пока нет ваших карточек — нажмите «🎲 Дать фант».")
+        lines = []
+        for num, card in enumerate(cards, 1):
+            text = (
+                card.text
+                if len(card.text) <= CARD_SNIPPET_MAX
+                else card.text[: CARD_SNIPPET_MAX - 1] + "…"
+            )
+            lines.append(f"{num}. #{card.id} — {text}")
+        return "Последние выданные вам карточки:\n" + "\n".join(lines)
+
+    def help_text(self) -> str:
+        """/help («Помощь») — шпаргалка по кнопкам и командам."""
+        return (
+            "Меню: кнопка «🎲 Дать фант» — новая карточка (solo или паре), "
+            "«Мои карточки» — последние до 3 выданных, /pair — соединить пару.\n"
+            "На сообщении-карточке есть кнопки: ✅ Выполнено, ⭐ Оценить (1..5), "
+            "после выполнения — 👍 / 👎 / ⚠ Report.\n"
+            "Полный список команд — в ответе на /start. /id — ваш Telegram ID."
+        )
 
     def done(self, user_id: str) -> str:
         """/done — отметить выполненной последнюю выданную карточку пары."""
@@ -308,6 +363,10 @@ class BotService:
             # выдача, чтобы /like /dislike /report по ним резолвились
             self._ugc.state.cards[card.id] = card
         self._ugc.mark_issued(pair, card)
+        # журнал «что выдано юзеру» («Мои карточки»): соло-пара это один юзер дважды
+        recipients = {u.id: u for u in pair.users}
+        for u in recipients.values():
+            self._issued_to.setdefault(u.id, []).append(card)
         return card
 
     def _vote_target(self, pair: Pair, text_sub: str | None) -> Card:
@@ -334,6 +393,11 @@ class BotService:
     def pair_for(self, user_id: str) -> Pair | None:
         """Пара юзера (или None) — публичный доступ для нижнего слоя/тестов."""
         return self._pairs.get(user_id)
+
+    def last_issued(self, user_id: str) -> Card | None:
+        """Последняя выданная юзеру карточка — гейт устаревших inline-кнопок."""
+        pair = self._pairs.get(user_id) or self._solo_pairs.get(user_id)
+        return None if pair is None else self._last_card.get(pair.id)
 
     # -- внутреннее -----------------------------------------------------------
 
@@ -401,6 +465,128 @@ def format_card(card: Card) -> str:
     return f"🔥 {card.theme}\n\n{card.text}"
 
 
+# -- конструкторы клавиатур (маленькие, для ожиданий тестов) -------------------
+
+
+def callback_of(action: str, card_id: str) -> str:
+    """callback_data карточного действия: 'act:<action>:<card_id>' (<=64 байт)."""
+    return f"{CB_PREFIX}:{action}:{card_id}"
+
+
+def main_menu_kb() -> Any:
+    """Reply-клавиатура главного меню: [фант] / [карточки, помощь]."""
+    from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=FANT_BUTTON_TEXT)],
+            [
+                KeyboardButton(text=CARDS_BUTTON_TEXT),
+                KeyboardButton(text=HELP_BUTTON_TEXT),
+            ],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def card_kb(card_id: str) -> Any:
+    """Inline-кнопки свежей карточки: [✅ Выполнено] [⭐ Оценить]."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=DONE_BUTTON_TEXT, callback_data=callback_of(CB_DONE, card_id)),
+            InlineKeyboardButton(text=RATE_BUTTON_TEXT, callback_data=callback_of(CB_RATE, card_id)),
+        ]]
+    )
+
+
+def rate_kb(card_id: str) -> Any:
+    """Второй экран оценки: inline-кнопки 1..5 ('act:rate<n>:<card_id>')."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    row = [
+        InlineKeyboardButton(text=str(score), callback_data=callback_of(f"rate{score}", card_id))
+        for score in range(1, 6)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
+def reaction_kb(card_id: str) -> Any:
+    """Кнопки после выполнения: [👍] [👎] / [⚠ Report]."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=LIKE_BUTTON_TEXT, callback_data=callback_of(CB_LIKE, card_id)),
+                InlineKeyboardButton(text=DISLIKE_BUTTON_TEXT, callback_data=callback_of(CB_DISLIKE, card_id)),
+            ],
+            [InlineKeyboardButton(text=REPORT_BUTTON_TEXT, callback_data=callback_of(CB_REPORT, card_id))],
+        ]
+    )
+
+
+def parse_callback(data: str) -> tuple[str, str] | None:
+    """'act:done:c1' -> ('done', 'c1'); укороченный/чужой формат -> None."""
+    parts = data.split(":")
+    if len(parts) == 3 and parts[0] == CB_PREFIX and parts[1] and parts[2]:
+        return parts[1], parts[2]
+    return None
+
+
+def score_of(action: str) -> int | None:
+    """callback-action 'rate4' -> 4; экранный 'rate' и прочие действия -> None."""
+    if not action.startswith(CB_RATE):
+        return None
+    tail = action[len(CB_RATE):]
+    if len(tail) == 1 and tail in "12345":
+        return int(tail)
+    return None
+
+
+def _callback_reply(
+    service: BotService, data: str, user_id: str
+) -> tuple[str, Any | None, bool]:
+    """callback 'act:<action>:<card_id>' -> (текст, новая разметка|None, alert?).
+
+    Разметка != None — переставить кнопки сообщения карточки (edit_reply_markup);
+    alert=True — answer_callback_query с show_alert (ошибки/пояснения).
+    Все ошибки сервиса/движка -> понятный текст (спиннер гасится всегда).
+    """
+    parsed = parse_callback(data)
+    if parsed is None:
+        return UNKNOWN_BUTTON, None, True
+    action, card_id = parsed
+    try:
+        score = score_of(action)
+        if action == CB_DONE or score is not None:
+            # операции по конкретной карточке: кнопка обязана совпасть с последней
+            last = service.last_issued(user_id)
+            if last is None or last.id != card_id:
+                raise BotError(STALE_BUTTON)
+            if action == CB_DONE:
+                return service.done(user_id), reaction_kb(card_id), False
+            return service.rate(user_id, score), reaction_kb(card_id), False
+        if action == CB_RATE:  # экран выбора оценки — разметку обновляем
+            return RATE_PROMPT, rate_kb(card_id), False
+        if action in {CB_LIKE, CB_DISLIKE, CB_REPORT}:
+            last = service.last_issued(user_id)
+            if last is None or last.id != card_id:
+                raise BotError(STALE_BUTTON)
+            by_action = {
+                CB_LIKE: service.like,
+                CB_DISLIKE: service.dislike,
+                CB_REPORT: service.report,
+            }
+            return by_action[action](user_id), None, False
+    except BotError as exc:  # NoPair/NotIssued/AlreadyVoted -> friendly
+        return str(exc), None, True
+    except NoCardAvailable:
+        return NO_CARDS_YET, None, True
+    return UNKNOWN_BUTTON, None, True
+
+
 def get_token() -> str | None:
     """Токен только из env DARDECK_BOT_TOKEN (не пустой)."""
     return os.environ.get(TOKEN_ENV) or None
@@ -436,41 +622,47 @@ class TelegramSender(Sender):
         except RuntimeError:
             loop = None
         if loop is not None:
-            task = loop.create_task(self._send(user.id, text))
+            task = loop.create_task(self._send(user.id, card))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
         else:
-            asyncio.run(self._send(user.id, text))
+            asyncio.run(self._send(user.id, card))
 
-    async def _send(self, chat_id: str, text: str) -> None:
-        """Доставка в Telegram: сбои не роняют хендлер, но видны в логе."""
+    async def _send(self, chat_id: str, card: Card) -> None:
+        """Доставка в Telegram: сбои не роняют хендлер, но видны в логе.
+
+        Карточка уходит с inline-кнопками [✅ Выполнено][⭐ Оценить] (Task 9).
+        """
         try:
-            await self._bot.send_message(chat_id=chat_id, text=text)
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text=format_card(card),
+                reply_markup=card_kb(card.id),
+            )
         except Exception:
             logger.exception("не удалось доставить карточку в chat %s", chat_id)
 
 
 def build_router(service: BotService) -> Any:
-    """aiogram-роутер с командами /start /pair /fant /today /id /done /rate /like /dislike /report.
+    """aiogram-роутер: команды + кнопки меню и карточки.
 
-    Хендлеры тонкие: разбор аргумента команды + перевод ошибок
+    Команды: /start /pair /fant /today /id /help /done /rate /like /dislike
+    /report. Хендлеры тонкие: разбор аргумента команды + перевод ошибок
     (BotError/NoCardAvailable) в понятный текст. aiogram импортируется здесь.
     /today — алиас /fant (обратная совместимость прежних юзеров).
+
+    Кнопки (Task 9): «Мои карточки»/«Помощь» — текстовые кнопки меню; карточки —
+    inline-callback 'act:<action>:<card_id>' (спиннер гасится всегда).
     """
     from aiogram import F, Router
     from aiogram.filters import Command, CommandStart
-    from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 
     router = Router(name="dardeck")
 
     @router.message(CommandStart())
     async def cmd_start(message: Any) -> None:
         reply = service.start(str(message.from_user.id), message.from_user.username)
-        keyboard = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text=FANT_BUTTON_TEXT)]],
-            resize_keyboard=True,
-        )
-        await message.answer(reply, reply_markup=keyboard)
+        await message.answer(reply, reply_markup=main_menu_kb())
 
     @router.message(Command("pair"))
     async def cmd_pair(message: Any) -> None:
@@ -495,6 +687,15 @@ def build_router(service: BotService) -> Any:
     @router.message(Command("id"))
     async def cmd_id(message: Any) -> None:
         await _answer(message, service.show_id)
+
+    @router.message(Command("help"))
+    @router.message(F.text == HELP_BUTTON_TEXT)  # кнопка меню «Помощь»
+    async def cmd_help(message: Any) -> None:
+        await _answer(message, service.help_text)
+
+    @router.message(F.text == CARDS_BUTTON_TEXT)  # кнопка меню «Мои карточки»
+    async def on_cards_button(message: Any) -> None:
+        await _answer(message, service.my_cards)
 
 
     @router.message(Command("done"))
@@ -521,6 +722,19 @@ def build_router(service: BotService) -> Any:
         sub = _first_arg(message) or None
         await _answer(message, lambda uid: service.report(uid, sub))
 
+    @router.callback_query(F.data)  # inline-кнопки карточки ('act:<action>:<id>')
+    async def on_callback(cq: Any) -> None:
+        """Callback карточки: спиннер гасится всегда (answer_callback_query)."""
+        text, markup, alert = _callback_reply(
+            service, cq.data or "", str(cq.from_user.id)
+        )
+        if markup is not None:  # переставить кнопки сообщения карточки
+            try:
+                await cq.message.edit_reply_markup(reply_markup=markup)
+            except Exception:  # сообщение могло устареть — кнопки не критичны
+                logger.exception("не удалось переставить кнопки карточки")
+        await cq.answer(text, show_alert=alert)
+
     return router
 
 
@@ -531,13 +745,19 @@ def _first_arg(message: Any) -> str:
 
 
 async def _answer(message: Any, action: Callable[[str], str]) -> None:
-    """Обёртка хендлеров: ошибки сервиса/движка -> текст юзеру, без стеков."""
+    """Обёртка хендлеров: ошибки сервиса/движка -> текст юзеру, без стеков.
+
+    «Каждое сообщение бота = клавиатура»: обычный ответ уходит с главным меню.
+    """
     try:
-        await message.answer(action(str(message.from_user.id)))
+        reply = action(str(message.from_user.id))
     except BotError as exc:
-        await message.answer(str(exc))
+        await message.answer(str(exc), reply_markup=main_menu_kb())
+        return
     except NoCardAvailable:
-        await message.answer("Новых карточек пока нет — попробуйте позже.")
+        await message.answer(NO_CARDS_YET, reply_markup=main_menu_kb())
+        return
+    await message.answer(reply, reply_markup=main_menu_kb())
 
 
 def main() -> None:
