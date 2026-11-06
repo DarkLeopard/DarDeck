@@ -62,7 +62,8 @@ class ListSource:
 
 def make_service(sender: Sender | None = None,
                  cards: list[Card] | None = None,
-                 ratings_path: str | None = None) -> BotService:
+                 ratings_path: str | None = None,
+                 test_users: set[str] | None = None) -> BotService:
     deck = cards if cards is not None else [
         make_card("c1", "Спросите партнёра о детстве"),
         make_card("c2", "Свидание на выходные вместе"),
@@ -75,6 +76,7 @@ def make_service(sender: Sender | None = None,
         ugc=UgcEngine(),
         ratings=RatingEngine(),
         ratings_path=ratings_path,
+        test_users=test_users,
     )
 
 
@@ -423,16 +425,138 @@ def test_module_imports_without_token_and_without_aiogram_top_level():
     assert proc.stdout.strip() == "ok"
 
 
-def test_router_registers_eight_commands():
+def test_router_registers_ten_commands_with_fant_and_id():
     aiogram = pytest.importorskip("aiogram")
     from aiogram.filters import Command, CommandStart
 
     router = bot_module.build_router(make_service())
     handlers = router.message.handlers
-    assert len(handlers) == 8
+    assert len(handlers) == 11  # 10 команд + хендлер кнопки «Дать фант»
     filter_objects = [f for h in handlers for f in getattr(h, "filters", [])]
     # фильтры обёрнуты в FilterObject — сам Command лежит в .callback
     inner = [f.callback for f in filter_objects]
     commands = [c for f in inner for c in getattr(f, "commands", [])]
-    assert commands == ["start", "pair", "today", "done", "rate", "like", "dislike", "report"]
+    assert commands == [
+        "start", "pair", "fant", "today", "id",
+        "done", "rate", "like", "dislike", "report",
+    ]
     assert any(isinstance(f, CommandStart) for f in inner)
+
+
+# -- Task 8: соло-режим /fant, владелец-тест (whitelist), /id -------------------
+
+
+def test_parse_test_user_ids_csv_int():
+    """DARDECK_TEST_USER_IDS: csv int -> set строк; мусор/пустые пропускаются."""
+    assert bot_module.parse_test_user_ids(None) == set()
+    assert bot_module.parse_test_user_ids("") == set()
+    assert bot_module.parse_test_user_ids("111, 222") == {"111", "222"}
+    assert bot_module.parse_test_user_ids("333,,abc,444") == {"333", "444"}
+
+
+def test_solo_fant_issues_card_to_single_user():
+    """/fant одиночке: соло-карточка уходит только ему (self-пара на движке)."""
+    sender = MockSender()
+    service = make_service(sender=sender)
+    service.start("u1", "ann")
+
+    reply = service.fant("u1", "ann")
+    assert "Фант" in reply
+    assert len(sender.sent) == 1
+    assert sender.sent[0][0].id == "u1"
+
+    # движок ведёт состояние соло-жизни на self-паре 'solo:<uid>' (учёт/no-repeat)
+    solo = service._solo_pairs["u1"]
+    assert solo.id == "solo:u1"
+    assert solo.user_a is solo.user_b
+    state = service._engine.pair_state(solo)
+    assert state.issued == {"c1"}
+    # реальная пара не создана: /pair по-прежнему доступен юзеру
+    assert service.pair_for("u1") is None
+
+
+def test_solo_fant_second_same_day_already_issued():
+    """Повторный /fant в тот же день — AlreadyIssued (free: 1/день, friendly)."""
+    service = make_service()
+    service.start("u1", "ann")
+    service.fant("u1", "ann")
+    with pytest.raises(AlreadyIssued):
+        service.fant("u1", "ann")
+
+
+def test_whitelist_user_bypasses_gate_and_repeats_fant():
+    """Whitelist (DARDECK_TEST_USER_IDS) обходит дневной гейт: /fant подряд."""
+    sender = MockSender()
+    service = make_service(sender=sender,
+                           test_users=bot_module.parse_test_user_ids("111"))
+    for step in range(3):
+        reply = service.fant("111", f"u{step}")
+        assert "Фант" in reply
+    assert len(sender.sent) == 3
+    assert [card.id for _, card in sender.sent] == ["c1", "c2", "c3"]  # no-repeat
+
+    # контроль: юзер вне whitelist той же колоды упирается в гейт после первой
+    sender2 = MockSender()
+    gated = make_service(sender=sender2)
+    gated.start("u1", "ann")
+    gated.fant("u1", "ann")
+    with pytest.raises(AlreadyIssued):
+        gated.fant("u1", "ann")
+
+
+def test_fant_after_pairing_delivers_to_both_partners():
+    """После /pair «Дать фант» выдаёт карточку обоим партнёрам (алиас /today)."""
+    sender = MockSender()
+    service = make_service(sender=sender)
+    pair_up(service)
+    reply = service.fant("u2", "bob")
+    assert "вам обоим" in reply
+    assert {u.id for u, _ in sender.sent} == {"u1", "u2"}
+
+
+def test_solo_fant_registers_receivers_in_ugc_and_vote_works():
+    """Антифарм UGC сохраняется: solo-выдача -> mark_issued, /like юзера принимается."""
+    service = make_service()
+    service.start("u1", "ann")
+    service.fant("u1", "ann")
+    card = service._last_card["solo:u1"]
+    assert service._ugc.state.issued_to[card.id] == {"u1"}
+
+    assert "Лайк учтён" in service.like("u1")
+    assert service._ugc.state.like_count(card.id) == 1
+
+
+def test_solo_fant_gate_is_per_solo_pair_not_real_pair_state():
+    """Соло-гейт считывается с PairState соло-жизни: реальная пара не смешивается."""
+    service = make_service()
+    service.start("u1", "ann")
+    service.fant("u1", "ann")  # соло-выдача today
+    service.pair("u1", "ann")
+    service.pair("u2", "bob")
+    # соло-жизни своя; парная выдача доступна сразу (отдельный pair_id)
+    reply = service.today("u1")
+    assert "Карточка дня" in reply
+    pair = service.pair_for("u1")
+    assert pair.id != "solo:u1"
+    # движок помнит показы соло-жизни отдельно: у парной карточки свои получатели
+    assert service._ugc.state.issued_to["c1"] == {"u1", "u2"}
+    with pytest.raises(AlreadyIssued):
+        service.fant("u1", "ann")  # теперь юзер в паре: гейт на парной карточке
+
+
+def test_show_id_returns_telegram_id():
+    """/id для любого юзера: только сам id, без секретов."""
+    service = make_service()
+    assert service.show_id("123456789") == "Ваш Telegram ID: 123456789"
+
+
+def test_today_without_pair_after_fant_uses_solo_pair():
+    """/today одиночке-без-пары: NoPair, если ещё нет соло-выдачи; после /fant — соло."""
+    service = make_service()
+    service.start("u1", "ann")
+    with pytest.raises(NoPair):
+        service.today("u1")
+    service.fant("u1", "ann")
+    # после соло-выдачи /today тоже работает на той же self-паре (гейт сработает)
+    with pytest.raises(AlreadyIssued):
+        service.today("u1")

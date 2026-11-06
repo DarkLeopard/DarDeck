@@ -52,8 +52,10 @@ from ..sender import LogSender, Sender
 TOKEN_ENV = "DARDECK_BOT_TOKEN"
 DB_PATH_ENV = "DARDECK_DB_PATH"
 RATINGS_SNAPSHOT_ENV = "DARDECK_RATINGS_SNAPSHOT"
+TEST_USER_IDS_ENV = "DARDECK_TEST_USER_IDS"
 DEFAULT_DB_PATH = "dardeck.db"  # по умолчанию файл (не :memory:) — персистентность
 RATINGS_SNAPSHOT_FILE = "ratings.json"  # снимок оценок рядом с файлом БД
+FANT_BUTTON_TEXT = "Дать фант"  # кнопка клавиатуры — алиас /fant (Task 8, solo)
 
 logger = logging.getLogger("dardeck.bots")
 
@@ -90,6 +92,27 @@ def ratings_snapshot_path(db_path: str) -> str:
     return env if env else default_ratings_path(db_path)
 
 
+def parse_test_user_ids(raw: str | None) -> set[str]:
+    """DARDECK_TEST_USER_IDS (csv int, Telegram IDs) -> set строк-идентификаторов.
+
+    Владелец-тест (Task 8): юзер из списка обходит дневной/интервальный гейт
+    выдачи. Пустые элементы и не-числа пропускаются (без падения старта бота);
+    сравнение — со строковым user.id, поэтому храним как строки.
+    """
+    if not raw:
+        return set()
+    ids: set[str] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(str(int(part)))
+        except ValueError:
+            logger.warning("%s: не число %r — элемент пропущен", TEST_USER_IDS_ENV, part)
+    return ids
+
+
 # -- сервисная прослойка (без aiogram; движок + Sender) ----------------------
 
 
@@ -109,14 +132,17 @@ class BotService:
         ugc: UgcEngine,
         ratings: RatingEngine,
         ratings_path: str | Path | None = None,
+        test_users: set[str] | None = None,
     ) -> None:
         self._engine = engine
         self._sender = sender
         self._ugc = ugc  # антифарм голосов + промоушен/жалобы (engine.ugc)
         self._ratings = ratings  # журнал оценок /rate (engine.ratings)
         self._ratings_path = None if ratings_path is None else str(ratings_path)
+        self._test_users = test_users or set()  # whitelist: обход интервального гейта
         self._users: dict[str, User] = {}
         self._pairs: dict[str, Pair] = {}  # user_id -> Pair
+        self._solo_pairs: dict[str, Pair] = {}  # user_id -> сольная self-пара
         self._pending: list[str] = []  # юзеры в ожидании спаривания
         self._last_card: dict[str, Card] = {}  # pair_id -> последняя выданная карточка
         self._issued: dict[str, list[Card]] = {}  # pair_id -> выданные карточки (по порядку)
@@ -129,10 +155,11 @@ class BotService:
         """/start — регистрация юзера."""
         user = self._get_user(user_id, username)
         return (
-            "Привет! Dardeck — карточки для вашего вечера.\n"
-            "Шаги:\n"
+            "Привет! Dardeck — фанты для вашего вечера.\n"
+            "Без пары: /fant (или кнопка «Дать фант») — карточка соло.\n"
+            "В паре:\n"
             "1) /pair — стать в пару (оба партнёра должны выполнить)\n"
-            "2) /today — получить карточку дня\n"
+            "2) /fant или /today — получить карточку дня (обоим)\n"
             "3) /done — отметить, что карточка выполнена\n"
             "4) /rate 1..5 — оценить карточку\n"
             "5) /like /dislike /report — реакция на карточку"
@@ -163,21 +190,35 @@ class BotService:
         """/today — выдать карточку дня: движок решает, Sender доставляет обоим."""
         pair = self._pair_of(user_id)
         stamped = now or datetime.now()
-        self._ensure_daily_gate(pair, stamped)
-
-        card = self._engine.issue_card(pair)
-        self._last_card[pair.id] = card
-        self._issued.setdefault(pair.id, []).append(card)
-        self._last_issue_at[pair.id] = stamped
-        # антифарм UGC: получатели карточки = оба участника пары (только они голосуют)
-        if self._ugc.get(card.id) is None:
-            # seed-карточки не создаются через UgcEngine: в реестр их добавляет
-            # выдача, чтобы /like /dislike /report по ним резолвились
-            self._ugc.state.cards[card.id] = card
-        self._ugc.mark_issued(pair, card)
+        self._issue(pair, stamped, user_id)
         for u in pair.users:
-            self._sender.send(u, card)
+            self._sender.send(u, self._last_card[pair.id])
         return "Карточка дня отправлена вам обоим. Выполнили — ставьте /done."
+
+    def fant(self, user_id: str, username: str | None = None,
+             now: datetime | None = None) -> str:
+        """/fant («Дать фант») — выдача: соло-card одиночке, паре — обеим половинками.
+
+        - юзер без пары: синтетическая self-пара Pair(id='solo:<uid>', user_a=u,
+          user_b=u) — движок ведёт состояние соло-жизни (no-repeat, учёт) на
+          этом PairState; реальная структура пары не затрагивается;
+        - юзер в паре: тот же путь, что /today — карточка уходит обоим;
+        - антифарм UGC: mark_issued регистрирует фактических получателей;
+        - cooldown: free 1/день, кроме whitelist (DARDECK_TEST_USER_IDS).
+        """
+        user = self._get_user(user_id, username)
+        pair = self._pairs.get(user_id)
+        if pair is not None:  # парный юзер: /fant — алиас /today
+            return self.today(user_id, now)
+        solo = self._solo_pair(user)
+        stamped = now or datetime.now()
+        card = self._issue(solo, stamped, user_id)
+        self._sender.send(user, card)
+        return "Фант для вас! Выполнили — ставьте /done."
+
+    def show_id(self, user_id: str) -> str:
+        """/id — показать свой Telegram ID (всем юзерам, без секретов кроме id)."""
+        return f"Ваш Telegram ID: {user_id}"
 
     def done(self, user_id: str) -> str:
         """/done — отметить выполненной последнюю выданную карточку пары."""
@@ -254,6 +295,21 @@ class BotService:
             return "Спасибо! Лайк учтён."
         return "Дизлайк учтён."
 
+    def _issue(self, pair: Pair, stamped: datetime, user_id: str) -> Card:
+        """Выдача карточки паре (или self-паре): гейт + учёт адаптера + антифарм."""
+        self._ensure_daily_gate(pair, stamped, user_id)
+        card = self._engine.issue_card(pair)
+        self._last_card[pair.id] = card
+        self._issued.setdefault(pair.id, []).append(card)
+        self._last_issue_at[pair.id] = stamped
+        # антифарм UGC: получатели карточки = участники пары (только они голосуют)
+        if self._ugc.get(card.id) is None:
+            # seed-карточки не создаются через UgcEngine: в реестр их добавляет
+            # выдача, чтобы /like /dislike /report по ним резолвились
+            self._ugc.state.cards[card.id] = card
+        self._ugc.mark_issued(pair, card)
+        return card
+
     def _vote_target(self, pair: Pair, text_sub: str | None) -> Card:
         """Карточка для голоса: последняя выданная паре; с подстрокой — по тексту."""
         issued = self._issued.get(pair.id, [])
@@ -289,20 +345,40 @@ class BotService:
         return user
 
     def _pair_of(self, user_id: str) -> Pair:
-        pair = self._pairs.get(user_id)
+        """Пара юзера: реальная (после /pair) либо соло-пара (после /fant)."""
+        pair = self._pairs.get(user_id) or self._solo_pairs.get(user_id)
         if pair is None:
-            raise NoPair("Вы не в паре. Начните с /pair — обоим партнёрам нужно вызвать.")
+            raise NoPair(
+                "Вы не в паре. Возьмите соло-карточку /fant "
+                "или начните с /pair — обоим партнёрам нужно вызвать."
+            )
         return pair
 
-    def _ensure_daily_gate(self, pair: Pair, now: datetime) -> None:
+    def _solo_pair(self, user: User) -> Pair:
+        """Синтетическая self-пара соло-жизни: движок ведёт PairState по id.
+
+        Дважды один юзер — карточки no-repeat и учёт live в engine, реальная
+        пара (созданная позже) имеет свой pair_id и не смешивается с соло.
+        """
+        pair = self._solo_pairs.get(user.id)
+        if pair is None:
+            pair = Pair(id=f"solo:{user.id}", user_a=user, user_b=user)
+            self._solo_pairs[user.id] = pair
+        return pair
+
+    def _ensure_daily_gate(self, pair: Pair, now: datetime, user_id: str) -> None:
         """Серверный интервал до новой выдачи — политика пары premium-aware:
 
+        - whitelist (DARDECK_TEST_USER_IDS): гейт не применяется — владельцу
+          доступен повторный тест выдачи;
         - free-пара (по умолчанию): интервал движка (engine.policy.interval),
           поведение бесплатного режима без изменений;
         - премиум-член пары: resolve_policy даёт premium-режим — интервал
           расслабляется до минимального премиум-лимита (грант премиум-дня,
           например автопромоушеном, позволяет выдавать карточки чаще).
         """
+        if user_id in self._test_users:
+            return
         last = self._last_issue_at.get(pair.id)
         if last is None:
             return
@@ -375,29 +451,51 @@ class TelegramSender(Sender):
 
 
 def build_router(service: BotService) -> Any:
-    """aiogram-роутер с командами /start /pair /today /done /rate /like /dislike /report.
+    """aiogram-роутер с командами /start /pair /fant /today /id /done /rate /like /dislike /report.
 
     Хендлеры тонкие: разбор аргумента команды + перевод ошибок
     (BotError/NoCardAvailable) в понятный текст. aiogram импортируется здесь.
+    /today — алиас /fant (обратная совместимость прежних юзеров).
     """
-    from aiogram import Router
+    from aiogram import F, Router
     from aiogram.filters import Command, CommandStart
+    from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 
     router = Router(name="dardeck")
 
     @router.message(CommandStart())
     async def cmd_start(message: Any) -> None:
         reply = service.start(str(message.from_user.id), message.from_user.username)
-        await message.answer(reply)
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=FANT_BUTTON_TEXT)]],
+            resize_keyboard=True,
+        )
+        await message.answer(reply, reply_markup=keyboard)
 
     @router.message(Command("pair"))
     async def cmd_pair(message: Any) -> None:
         reply = service.pair(str(message.from_user.id), message.from_user.username)
         await message.answer(reply)
 
+    @router.message(Command("fant"))
+    async def cmd_fant(message: Any) -> None:
+        username = message.from_user.username
+        await _answer(message, lambda uid: service.fant(uid, username))
+
+    @router.message(F.text == FANT_BUTTON_TEXT)  # кнопка клавиатуры — алиас /fant
+    async def on_fant_button(message: Any) -> None:
+        username = message.from_user.username
+        await _answer(message, lambda uid: service.fant(uid, username))
+
     @router.message(Command("today"))
     async def cmd_today(message: Any) -> None:
-        await _answer(message, lambda uid: service.today(uid))
+        username = message.from_user.username
+        await _answer(message, lambda uid: service.fant(uid, username))
+
+    @router.message(Command("id"))
+    async def cmd_id(message: Any) -> None:
+        await _answer(message, service.show_id)
+
 
     @router.message(Command("done"))
     async def cmd_done(message: Any) -> None:
@@ -471,6 +569,7 @@ def main() -> None:
         ugc=UgcEngine(),
         ratings=ratings,
         ratings_path=ratings_snapshot_path(db_path),
+        test_users=parse_test_user_ids(os.environ.get(TEST_USER_IDS_ENV)),
     )
 
     if isinstance(sender, LogSender):
